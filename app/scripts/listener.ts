@@ -1,26 +1,32 @@
-import { Connection, PublicKey, clusterApiUrl, LAMPORTS_PER_SOL } from "@solana/web3.js";
-const Treasury_Address = new PublicKey("BnyU8BGb6Ut6zvM1iRyzpJk2DtS8qAJsdyMvvZUAs1CZ");
+// File: app/scripts/listener.ts
+
+import { Connection, PublicKey, clusterApiUrl, LAMPORTS_PER_SOL, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
 import { getOrCreateAssociatedTokenAccount, mintTo } from "@solana/spl-token";
-import { LST_MINT_ADDRESS, TREASURY_WALLET_ADDRESS, SOL_TO_LST_RATE } from "./constants.js";
+import { LST_MINT_ADDRESS, TREASURY_WALLET_ADDRESS, SOL_TO_LST_RATE, TOKEN_PROGRAM_ID } from "./constants.js";
 import { loadTreasuryKeypair } from "./utils.js";
 
 const treasuryKeypair = loadTreasuryKeypair();
 
 async function main() {
-    console.log("starting the LST minting service...");
+    console.log("🚀 Starting the LST Staking service...");
     const connection = new Connection(clusterApiUrl("devnet"), "confirmed");
-    console.log("Connected to Solana devnet");
-    console.log(`📡 Listening for SOL deposits to ${TREASURY_WALLET_ADDRESS.toBase58()}`);
+
+    console.log(`📡 Monitoring wallet: ${TREASURY_WALLET_ADDRESS.toBase58()}`);
     console.log("------------------------------------------------------------------");
 
-    // Subscribe to logs for our treasury address
     connection.onLogs(
         TREASURY_WALLET_ADDRESS,
         async (logsResult, context) => {
-            // Check if the log is from a simple SOL transfer (System Program)
-            if (logsResult.logs.some(log => log.includes("11111111111111111111111111111111"))) {
-                console.log(`\n✅ Detected a potential SOL deposit. Signature: ${logsResult.signature}`);
-                await processDeposit(connection, logsResult.signature);
+            const { signature, logs } = logsResult;
+
+            if (logs.some(log => log.includes("Program 11111111111111111111111111111111 invoke"))) {
+                console.log(`\n✅ Detected a potential SOL deposit. Signature: ${signature}`);
+                await processDeposit(connection, signature);
+                console.log("------------------------------------------------------------------");
+
+            } else if (logs.some(log => log.includes(`Program ${TOKEN_PROGRAM_ID.toBase58()} invoke`))) {
+                console.log(`\n✅ Detected a potential LST withdrawal. Signature: ${signature}`);
+                await processWithdrawal(connection, signature);
                 console.log("------------------------------------------------------------------");
             }
         },
@@ -28,87 +34,100 @@ async function main() {
     );
 }
 
-// This is our main deposit handling function
+// Function to handle SOL deposits (unchanged)
 async function processDeposit(connection: Connection, signature: string) {
+    // ... (This function remains the same as in Step 4)
     try {
-        // 1. Fetch the full transaction details using the signature
+        const transaction = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
+        if (!transaction) { console.log("   ❌ Transaction details not found."); return; }
+        const { preBalances, postBalances } = transaction.meta!;
+        const accountKeys = transaction.transaction.message.accountKeys;
+        const treasuryIndex = accountKeys.findIndex(key => key.pubkey.equals(TREASURY_WALLET_ADDRESS));
+        const depositorAddress = accountKeys[0].pubkey;
+        if (treasuryIndex === -1) { console.log("   ❌ Treasury address not found."); return; }
+        const depositedLamports = postBalances[treasuryIndex] - preBalances[treasuryIndex];
+        const depositedSol = depositedLamports / LAMPORTS_PER_SOL;
+        if (depositedSol <= 0) { console.log(`   - Ignoring outgoing/internal transaction. Amount: ${depositedSol} SOL.`); return; }
+        console.log(`   - Depositor: ${depositorAddress.toBase58()}`);
+        console.log(`   - Amount: ${depositedSol} SOL`);
+        const lstToMint = depositedSol * SOL_TO_LST_RATE;
+        console.log(`   - Minting ${lstToMint} LST...`);
+        const depositorAta = await getOrCreateAssociatedTokenAccount(connection, treasuryKeypair, LST_MINT_ADDRESS, depositorAddress);
+        const mintSignature = await mintTo(connection, treasuryKeypair, LST_MINT_ADDRESS, depositorAta.address, treasuryKeypair, lstToMint * (10 ** 9));
+        console.log(`   ✅ Successfully minted ${lstToMint} LST to ${depositorAddress.toBase58()}`);
+        console.log(`   Mint Transaction: ${mintSignature}`);
+    } catch (err) { console.error("   ❌ Error processing deposit:", err); }
+}
+
+// NEW function to handle LST withdrawals
+async function processWithdrawal(connection: Connection, signature: string) {
+    try {
+        // 1. Fetch the transaction details
         const transaction = await connection.getParsedTransaction(signature, {
             maxSupportedTransactionVersion: 0,
             commitment: "confirmed"
         });
 
-        if (!transaction) {
-            console.log("   ❌ Transaction details not found.");
+        if (!transaction || !transaction.meta) {
+            console.log("   ❌ Transaction details not found for withdrawal.");
             return;
         }
 
-        // 2. Find the SOL transfer details
-        const { meta } = transaction;
-        if (!meta || !meta.preBalances || !meta.postBalances) {
-            console.log("   ❌ Transaction meta or balances not found.");
-            return;
-        }
-        const preBalances = meta.preBalances;
-        const postBalances = meta.postBalances;
-        const accountKeys = transaction.transaction.message.accountKeys;
-        const treasuryIndex = accountKeys.findIndex(key => key.pubkey.equals(TREASURY_WALLET_ADDRESS));
+        // 2. Find the token transfer instruction
+        const tokenTransferInstruction = transaction.meta.innerInstructions
+            ?.flatMap(i => i.instructions)
+            .find(ix => "parsed" in ix && ix.parsed.type === "transfer" && ix.program === "spl-token");
 
-        // This is the depositor's address!
-        // We assume the first account in the transaction is the sender.
-        // This is a simplification; a more robust solution would analyze all instructions.
-        const depositorAddress = accountKeys[0].pubkey;
-
-        if (treasuryIndex === -1) {
-            console.log("   ❌ Treasury address not found in this transaction.");
+        if (!tokenTransferInstruction || !("parsed" in tokenTransferInstruction)) {
+            console.log("   ❌ No valid SPL token transfer instruction found.");
             return;
         }
 
-        // 3. Calculate the deposited amount
-        const oldBalance = preBalances[treasuryIndex];
-        const newBalance = postBalances[treasuryIndex];
-        const depositedLamports = newBalance - oldBalance;
-        const depositedSol = depositedLamports / LAMPORTS_PER_SOL;
+        const { info } = tokenTransferInstruction.parsed;
+        const lstReceived = parseInt(info.amount, 10) / (10 ** 9); // Amount in full tokens
+        const destination = new PublicKey(info.destination);
+        const sourceOwner = new PublicKey(info.source); // This is the user who sent us the LST
 
-        // Ignore transactions where SOL was spent, not received.
-        if (depositedSol <= 0) {
-            console.log(`   - Ignoring outgoing transaction or non-SOL transfer. Amount: ${depositedSol} SOL.`);
+        // 3. Security Check: Ensure the LST was sent TO our treasury
+        const treasuryAtaAccounts = await connection.getParsedTokenAccountsByOwner(
+            TREASURY_WALLET_ADDRESS,
+            { mint: LST_MINT_ADDRESS }
+        );
+        if (treasuryAtaAccounts.value.length === 0) {
+            console.log("   - Treasury ATA not found.");
+            return;
+        }
+        const treasuryAtaPubkey = treasuryAtaAccounts.value[0].pubkey;
+        if (!destination.equals(treasuryAtaPubkey)) {
+            console.log("   - Ignoring transfer not sent to our treasury ATA.");
             return;
         }
 
-        console.log(`   - Depositor: ${depositorAddress.toBase58()}`);
-        console.log(`   - Amount: ${depositedSol} SOL`);
+        console.log(`   - Withdrawer: ${sourceOwner.toBase58()}`);
+        console.log(`   - Amount: ${lstReceived} LST`);
 
-        // 4. Calculate the amount of LST to mint
-        const lstToMint = depositedSol * SOL_TO_LST_RATE;
-        console.log(`   - Minting ${lstToMint} LST...`);
+        // 4. Calculate the amount of SOL to return
+        const solToReturn = lstReceived / SOL_TO_LST_RATE;
+        console.log(`   - Returning ${solToReturn} SOL...`);
 
-        // 5. Mint the LST to the depositor
-        // First, get or create the depositor's associated token account for our LST
-        const depositorAta = await getOrCreateAssociatedTokenAccount(
-            connection,
-            treasuryKeypair,       // Payer for account creation
-            LST_MINT_ADDRESS,      // The LST mint
-            depositorAddress,      // The owner of the new account (the depositor)
+        // 5. Build and send the SOL transfer transaction
+        const transferTx = new Transaction().add(
+            SystemProgram.transfer({
+                fromPubkey: treasuryKeypair.publicKey,
+                toPubkey: sourceOwner,
+                lamports: solToReturn * LAMPORTS_PER_SOL,
+            })
         );
 
-        // Now, mint the tokens
-        const mintSignature = await mintTo(
-            connection,
-            treasuryKeypair,       // Payer of the transaction fee
-            LST_MINT_ADDRESS,      // The LST mint
-            depositorAta.address,  // The destination account
-            treasuryKeypair,       // The mint authority (our treasury)
-            lstToMint * (10 ** 9)  // The amount to mint, adjusted for decimals (9 for SPL tokens)
-        );
+        const returnSignature = await sendAndConfirmTransaction(connection, transferTx, [treasuryKeypair]);
 
-        console.log(`   ✅ Successfully minted ${lstToMint} LST to ${depositorAddress.toBase58()}`);
-        console.log(`   Mint Transaction: ${mintSignature}`);
+        console.log(`   ✅ Successfully returned ${solToReturn} SOL to ${sourceOwner.toBase58()}`);
+        console.log(`   Return Transaction: ${returnSignature}`);
 
     } catch (err) {
-        console.error("   ❌ Error processing deposit:", err);
+        console.error("   ❌ Error processing withdrawal:", err);
     }
 }
-
 
 main().catch(err => {
     console.error("Service encountered a fatal error:", err);

@@ -1,103 +1,151 @@
-import Image from "next/image";
+// File: app/page.tsx
+"use client";
 
-export default function Home() {
+import { useState, useEffect } from 'react';
+import { useConnection, useWallet } from '@solana/wallet-adapter-react';
+import { WalletMultiButton } from '@solana/wallet-adapter-react-ui';
+import { PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } from '@solana/web3.js';
+import { createTransferInstruction, getAssociatedTokenAddressSync } from '@solana/spl-token';
+import { LST_MINT_ADDRESS, TREASURY_WALLET_ADDRESS } from './scripts/constants'; // Import our constants
+
+export default function HomePage() {
+  const { connection } = useConnection();
+  const { publicKey, sendTransaction } = useWallet();
+
+  const [solBalance, setSolBalance] = useState(0);
+  const [lstBalance, setLstBalance] = useState(0);
+  const [depositAmount, setDepositAmount] = useState('');
+  const [withdrawAmount, setWithdrawAmount] = useState('');
+
+  // Function to fetch balances
+  const fetchBalances = async () => {
+    if (!publicKey) return;
+
+    // Fetch SOL balance
+    const sol = await connection.getBalance(publicKey);
+    setSolBalance(sol / LAMPORTS_PER_SOL);
+
+    // Fetch LST balance
+    try {
+      const userAta = getAssociatedTokenAddressSync(LST_MINT_ADDRESS, publicKey);
+      const lst = await connection.getTokenAccountBalance(userAta);
+      setLstBalance(lst.value.uiAmount || 0);
+    } catch (e) {
+      // If the ATA doesn't exist, balance is 0
+      setLstBalance(0);
+    }
+  };
+
+  // Fetch balances when wallet is connected or balances change
+  useEffect(() => {
+    if (publicKey) {
+      fetchBalances();
+    }
+  }, [publicKey, connection]);
+
+  // Handler for depositing SOL
+  const handleDeposit = async () => {
+    if (!publicKey || !depositAmount) return;
+
+    const lamports = parseFloat(depositAmount) * LAMPORTS_PER_SOL;
+    if (isNaN(lamports) || lamports <= 0) {
+      alert("Invalid amount");
+      return;
+    }
+
+    try {
+      const transaction = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey: publicKey,
+          toPubkey: TREASURY_WALLET_ADDRESS,
+          lamports: lamports,
+        })
+      );
+
+      const signature = await sendTransaction(transaction, connection);
+      console.log('Deposit tx signature:', signature);
+      alert(`Deposit successful! TX: ${signature}`);
+      // The backend listener will now mint LST automatically.
+      // We can add a delay and then refresh balances.
+      setTimeout(fetchBalances, 5000); // Refresh after 5s
+    } catch (error) {
+      console.error('Deposit failed', error);
+      alert(`Deposit failed: ${error}`);
+    }
+  };
+
+  // Handler for withdrawing LST
+  const handleWithdraw = async () => {
+    if (!publicKey || !withdrawAmount) return;
+
+    const amount = parseFloat(withdrawAmount) * (10 ** 9); // Adjust for 9 decimals
+    if (isNaN(amount) || amount <= 0) {
+      alert("Invalid amount");
+      return;
+    }
+
+    try {
+      // Get the user's and treasury's token accounts
+      const userAta = getAssociatedTokenAddressSync(LST_MINT_ADDRESS, publicKey);
+      const treasuryAta = getAssociatedTokenAddressSync(LST_MINT_ADDRESS, TREASURY_WALLET_ADDRESS);
+
+      const transaction = new Transaction().add(
+        createTransferInstruction(
+          userAta,                // from
+          treasuryAta,            // to
+          publicKey,              // owner
+          amount
+        )
+      );
+
+      const signature = await sendTransaction(transaction, connection);
+      console.log('Withdraw tx signature:', signature);
+      alert(`Withdrawal successful! TX: ${signature}`);
+      // The backend listener will now return SOL automatically.
+      setTimeout(fetchBalances, 5000); // Refresh after 5s
+    } catch (error) {
+      console.error('Withdrawal failed', error);
+      alert(`Withdrawal failed: ${error}`);
+    }
+  };
+
   return (
-    <div className="grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20 font-[family-name:var(--font-geist-sans)]">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="list-inside list-decimal text-sm/6 text-center sm:text-left font-[family-name:var(--font-geist-mono)]">
-          <li className="mb-2 tracking-[-.01em]">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] px-1 py-0.5 rounded font-[family-name:var(--font-geist-mono)] font-semibold">
-              app/page.tsx
-            </code>
-            .
-          </li>
-          <li className="tracking-[-.01em]">
-            Save and see your changes instantly.
-          </li>
-        </ol>
+    <main style={{ padding: '2rem', maxWidth: '600px', margin: 'auto' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <h1>My LST Staking</h1>
+        <WalletMultiButton />
+      </div>
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 w-full sm:w-auto md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
+      {publicKey ? (
+        <div>
+          <h3>Your Balances</h3>
+          <p>SOL: {solBalance.toFixed(4)}</p>
+          <p>LST: {lstBalance.toFixed(4)}</p>
+          <hr style={{ margin: '2rem 0' }} />
+
+          <h3>Deposit SOL, Get LST</h3>
+          <input
+            type="number"
+            value={depositAmount}
+            onChange={(e) => setDepositAmount(e.target.value)}
+            placeholder="Amount of SOL"
+            style={{ padding: '0.5rem', marginRight: '1rem' }}
+          />
+          <button onClick={handleDeposit} style={{ padding: '0.5rem 1rem' }}>Deposit</button>
+
+          <h3 style={{ marginTop: '2rem' }}>Withdraw LST, Get SOL</h3>
+          <input
+            type="number"
+            value={withdrawAmount}
+            onChange={(e) => setWithdrawAmount(e.target.value)}
+            placeholder="Amount of LST"
+            style={{ padding: '0.5rem', marginRight: '1rem' }}
+          />
+          <button onClick={handleWithdraw} style={{ padding: '0.5rem 1rem' }}>Withdraw</button>
         </div>
-      </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
-    </div>
+      ) : (
+        <p>Please connect your wallet to continue.</p>
+      )}
+    </main>
   );
 }
